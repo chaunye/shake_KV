@@ -62,7 +62,7 @@ class FusedMLAAttention:
         self.kv_lora_rank = attn_module.kv_lora_rank        # 512
         self.q_head_dim = self.qk_nope_dim + self.qk_rope_dim  # 192
 
-        # RoPE 表 (由外部设置)
+        # RoPE cos/sin 表 (由外部设置)
         self.cos_cache = None
         self.sin_cache = None
 
@@ -75,9 +75,10 @@ class FusedMLAAttention:
             'path_c_tokens': 0,
         }
 
-    def set_rope_cache(self, freqs_cis):
-        """设置 RoPE freqs_cis 查找表. Shape: [max_seq, rope_dim]"""
-        self.freqs_cis = freqs_cis.to(self.device)
+    def set_rope_cache(self, cos, sin):
+        """设置 RoPE cos/sin 查找表. Shape: [max_seq, rope_dim]"""
+        self.cos_cache = cos.to(self.device)
+        self.sin_cache = sin.to(self.device)
 
     # ─────────────────────────────────────────────────────────────────
     # 核心: 融合 attention (单源)
@@ -107,13 +108,11 @@ class FusedMLAAttention:
         self.stats['fused_calls'] += 1
         self.stats['total_latent_tokens'] += S
 
-        # ── Step 1: LayerNorm (fused, 不产生 HBM 中间张量) ──
+        # ── Step 1: RMSNorm (fused, 不产生 HBM 中间张量) ──
         ln_w = self.ln_weight.to(device)
-        ln_b = self.ln_bias.to(device) if self.ln_bias is not None else None
-        latent_norm = F.layer_norm(
-            cached_latent, [self.kv_lora_rank],
-            weight=ln_w, bias=ln_b, eps=1e-5
-        )  # [S, 512]
+        latent_f = cached_latent.float()
+        variance = latent_f.pow(2).mean(-1, keepdim=True)
+        latent_norm = (latent_f * torch.rsqrt(variance + 1e-6) * ln_w.float()).type_as(cached_latent)  # [S, 512]
 
         # ── Step 2: kv_b_proj (fused → 直接产出 K_nope + V) ──
         # 一次 matmul 同时产出 K 和 V, 避免两次独立的 HBM 读写
@@ -129,12 +128,18 @@ class FusedMLAAttention:
         v_out = kv_out[:, v_start:v_start + self.n_heads * self.v_dim]  # [S, 2048]
         v_out = v_out.view(S, self.n_heads, self.v_dim)  # [S, H, 128]
 
-        # ── Step 3: RoPE on k_pe ──
+        # ── Step 3: RoPE on k_pe (与 DeepSeek-V2-Lite 模型一致) ──
         pos = position_ids.to(device)
-        freqs = self.freqs_cis.to(device)[pos]  # [S, rope_dim]
+        cos_sel = self.cos_cache.to(device)[pos]  # [S, rope_dim]
+        sin_sel = self.sin_cache.to(device)[pos]  # [S, rope_dim]
 
-        k_pe = cached_kpe.to(device).unsqueeze(0).unsqueeze(0)  # [1, 1, S, 64]
-        k_pe_rot = self._apply_rope(k_pe, freqs).squeeze(0).squeeze(0)  # [S, 64]
+        k_pe = cached_kpe.to(device).float()  # [S, 64]
+        d = k_pe.shape[-1]
+        # pair-swap
+        k_swapped = k_pe.view(-1, d // 2, 2).transpose(2, 1).reshape(-1, d)
+        # rotate_half
+        k_rot_half = torch.cat([-k_swapped[..., d // 2:], k_swapped[..., :d // 2]], dim=-1)
+        k_pe_rot = (k_swapped * cos_sel + k_rot_half * sin_sel).type_as(cached_kpe)  # [S, 64]
 
         # ── Step 4: QK 点积 (在 latent 空间直接计算) ──
         # Q: [H, 128] nope + [H, 64] pe

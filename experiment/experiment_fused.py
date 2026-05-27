@@ -58,6 +58,75 @@ from fused_attention import (
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════════════════
 
+def generate(model, tokenizer, input_ids, past_key_values=None, max_new=64):
+    """统一的自回归生成函数 (移植自 compare_v2.py).
+
+    关键:
+    - 显式 position_ids 确保 RoPE 位置正确
+    - cache truncation trick 避免重复 KV entry 偏置 attention
+
+    Returns:
+        (text, all_ids, first_token_logits): 生成文本, token IDs, 首 token logits
+    """
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    seq_len = input_ids.shape[1]
+
+    # Step 0: process input (with or without prefilled cache)
+    with torch.no_grad():
+        if past_key_values is not None:
+            # 统一转换为 tuple 格式以便 truncation 操作
+            if not isinstance(past_key_values, tuple):
+                past_key_values = past_key_values.to_legacy_cache()
+            plen = past_key_values[0][0].shape[2]
+            if seq_len <= plen:
+                # 输入已全在 cache 中 → truncate cache by 1,
+                # 让模型自然处理最后一个 token, 避免重复 KV entry
+                past_key_values = tuple(
+                    (k[:, :, :-1, :].contiguous(), v[:, :, :-1, :].contiguous())
+                    for k, v in past_key_values
+                )
+                cur = input_ids[:, plen - 1:]
+                outs = model(cur, past_key_values=past_key_values, use_cache=True)
+            else:
+                cur = input_ids[:, plen:]
+                outs = model(cur, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outs.past_key_values
+        else:
+            outs = model(input_ids, use_cache=True)
+
+    past_key_values = outs.past_key_values
+    first_logits = outs.logits[:, -1, :]
+    nxt = first_logits.argmax(dim=-1, keepdim=True)
+    all_tokens = [nxt]
+    cur = nxt
+
+    # Steps 1+: autoregressive with explicit position_ids
+    for step in range(max_new - 1):
+        pos = torch.full((1, 1), seq_len + step, dtype=torch.long, device=device)
+        with torch.no_grad():
+            outs = model(cur, past_key_values=past_key_values, use_cache=True, position_ids=pos)
+        past_key_values = outs.past_key_values
+        nxt = outs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        all_tokens.append(nxt)
+        cur = nxt
+        if tokenizer.eos_token_id and nxt.item() == tokenizer.eos_token_id:
+            break
+
+    all_ids = torch.cat(all_tokens, dim=-1).tolist()[0]
+    text = tokenizer.decode(all_ids, skip_special_tokens=True)
+    return text, all_ids, first_logits
+
+
+def detect_attention_overlap(len_a, len_b):
+    """启发式注意力重叠检测 (移植自 compare_v2.py).
+
+    标记 prefix 的位置 0 和最后 5 个位置需要重算.
+    """
+    need = sorted(set([0] + list(range(max(0, len_a - 5), len_a))))
+    return need
+
+
 def kv_memory_bytes(past_key_values):
     """计算 KV cache 占用的字节数."""
     total = 0
@@ -81,27 +150,65 @@ def get_layer_device(model, layer_idx):
     return next(model.model.layers[layer_idx].parameters()).device
 
 
-def get_rope_freqs(model, max_len):
-    """获取 RoPE freqs_cis."""
+def get_rope_cos_sin(model, max_len):
+    """获取 RoPE 的 cos, sin 表. 形状: [max_len, rope_dim]."""
     attn0 = model.model.layers[0].self_attn
     device = next(attn0.parameters()).device
-    dummy_pos = torch.arange(max_len, device=device)
-    freqs_cis, _ = attn0.rotary_emb(dummy_pos, max_len)
-    return freqs_cis
+    dummy = torch.zeros(1, 1, max_len, attn0.qk_rope_head_dim, device=device)
+    cos, sin = attn0.rotary_emb(dummy, seq_len=max_len)
+    return cos, sin
 
 
-def apply_rope_complex(k_pe, freqs_cis, position_ids):
-    """对 k_pe 应用 RoPE (DeepSeek-V2 复数乘法)."""
+def apply_rope_pair_swap(k_pe, cos, sin, position_ids):
+    """对 k_pe 应用 RoPE (与 DeepSeek-V2-Lite modeling_deepseek.py 一致).
+
+    流程: pair-swap → (x * cos) + (rotate_half(x) * sin)
+    cos/sin 形状: [max_len, rope_dim]
+    k_pe 形状: [S, D] 或 [B, S, D] 或 [B, H, S, D]
+    position_ids: [S] — 必须与 k_pe 的序列维度匹配
+    """
     device = k_pe.device
-    freqs = freqs_cis.to(device)[position_ids.to(device)]
-    d = k_pe.shape[-1]
-    x_complex = torch.view_as_complex(k_pe.float().reshape(-1, d // 2, 2))
-    freqs_complex = torch.view_as_complex(freqs.float().reshape(-1, d // 2, 2))
-    x_rotated = x_complex * freqs_complex
-    return torch.view_as_real(x_rotated).flatten(-2).type_as(k_pe)
+    cos_sel = cos.to(device)[position_ids.to(device)]  # [S, rope_dim]
+    sin_sel = sin.to(device)[position_ids.to(device)]  # [S, rope_dim]
+
+    # 统一到 4D [B, H, S, D]
+    orig_dim = k_pe.dim()
+    if orig_dim == 2:
+        k = k_pe.float().unsqueeze(0).unsqueeze(0)  # [1, 1, S, D]
+    elif orig_dim == 3:
+        k = k_pe.float().unsqueeze(0)                # [1, B, S, D]
+    else:
+        k = k_pe.float()
+
+    # cos/sin 广播到 [1, 1, S, D]
+    c = cos_sel.view(1, 1, -1, cos_sel.shape[-1])
+    s = sin_sel.view(1, 1, -1, sin_sel.shape[-1])
+
+    b, h, s_len, d = k.shape
+    # pair-swap
+    k_swapped = k.view(b, h, s_len, d // 2, 2).transpose(4, 3).reshape(b, h, s_len, d)
+    # rotate_half
+    k_rot_half = torch.cat([-k_swapped[..., d // 2:], k_swapped[..., :d // 2]], dim=-1)
+    result = k_swapped * c + k_rot_half * s
+
+    # 恢复原始维度
+    if orig_dim == 2:
+        result = result.squeeze(0).squeeze(0)
+    elif orig_dim == 3:
+        result = result.squeeze(0)
+
+    return result.type_as(k_pe)
 
 
-def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, freqs_cis):
+def rms_norm(x, weight, eps=1e-6):
+    """RMSNorm — 与 DeepseekV2RMSNorm 一致."""
+    x_f = x.float()
+    variance = x_f.pow(2).mean(-1, keepdim=True)
+    x_norm = x_f * torch.rsqrt(variance + eps)
+    return (x_norm * weight.float()).type_as(x)
+
+
+def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, cos, sin):
     """
     从 latent + k_pe 重建完整 KV (非融合, 用于 MLA+CB Python 策略).
 
@@ -112,9 +219,10 @@ def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, freqs_cis)
     device = latent.device
     S = latent.shape[0]
 
-    # LayerNorm
+    # RMSNorm (不是 LayerNorm!)
     ln_w = attn_module.kv_a_layernorm.weight.to(device)
-    latent_norm = F.layer_norm(latent, [attn_module.kv_lora_rank], weight=ln_w, eps=1e-5)
+    eps = attn_module.kv_a_layernorm.variance_epsilon
+    latent_norm = rms_norm(latent, ln_w, eps)
 
     # kv_b_proj → K_nope + V
     W = attn_module.kv_b_proj.weight.to(device)
@@ -130,8 +238,8 @@ def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, freqs_cis)
     k_nope = kv_out[:, :n_heads * nope_dim].view(S, n_heads, nope_dim)
     v_out = kv_out[:, n_heads * nope_dim:n_heads * nope_dim + n_heads * v_dim].view(S, n_heads, v_dim)
 
-    # RoPE on k_pe
-    k_pe_rot = apply_rope_complex(k_pe, freqs_cis, position_ids)  # [S, 64]
+    # RoPE on k_pe (pair-swap, 与模型内部一致)
+    k_pe_rot = apply_rope_pair_swap(k_pe, cos, sin, position_ids)  # [S, 64]
 
     # 拼接完整 K: [S, n_heads, nope_dim + rope_dim]
     rope_dim = attn_module.qk_rope_head_dim
@@ -159,46 +267,28 @@ class StrategyResult:
     extra_info: Dict = None
 
 
-def strategy_ground_truth(model, tokenizer, input_ids, max_new=64):
-    """[GT] 全量重算 — 标准自回归生成."""
-    device = input_ids.device
+def strategy_ground_truth(model, tokenizer, input_ids, context_len, max_new=64):
+    """[GT] 全量重算 — 标准自回归生成.
 
+    使用 context_len 与其他策略保持一致的输入长度.
+    """
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    with torch.no_grad():
-        out = model(input_ids, use_cache=True)
-
-    past_kv = out.past_key_values
-    torch.cuda.synchronize()
-    ttft = time.perf_counter() - t0
-
-    nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    tokens = [nxt]
-    cur = nxt
-
-    for _ in range(max_new - 1):
-        with torch.no_grad():
-            outs = model(cur, past_key_values=past_kv, use_cache=True)
-        past_kv = outs.past_key_values
-        nxt = outs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        tokens.append(nxt)
-        cur = nxt
-        if tokenizer.eos_token_id and nxt.item() == tokenizer.eos_token_id:
-            break
+    text, all_ids, _ = generate(model, tokenizer, input_ids[:, :context_len], max_new=max_new)
 
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
 
-    all_ids = torch.cat(tokens, dim=-1).tolist()[0]
-    text = tokenizer.decode(all_ids, skip_special_tokens=True)
-    gpu_mb = kv_memory_bytes(past_kv) / 1024**2
-
-    del past_kv, out
+    # 获取 KV cache 大小
+    with torch.no_grad():
+        out = model(input_ids[:, :context_len], use_cache=True)
+    gpu_mb = kv_memory_bytes(out.past_key_values) / 1024**2
+    del out
     torch.cuda.empty_cache()
 
     return StrategyResult(
-        name="GT", output_text=text, ttft=ttft, total_time=total,
+        name="GT", output_text=text, ttft=total, total_time=total,
         gpu_cache_mb=gpu_mb, cpu_cache_mb=0.0, output_ids=all_ids
     )
 
@@ -206,56 +296,84 @@ def strategy_ground_truth(model, tokenizer, input_ids, max_new=64):
 def strategy_pure_cacheblend(model, tokenizer, input_ids, context_len, max_new=64,
                               chunk_size=128, recompute_ratio=0.25):
     """
-    [Pure_CB] 纯 CacheBlend — 完整 KV 缓存 + 选择性重算.
+    [Pure_CB] 纯 CacheBlend — 完整 KV 空间的选择性重算 (移植自 compare_v2.py).
 
-    缓存前缀 chunk 的完整 KV, 对非前缀 chunk 选择性重算.
+    流程:
+      1. 分别推理 prefix 和 suffix (各自独立, 互不看到对方的上下文)
+      2. 拼接 KV → kv_stitch (suffix 的 KV 是 "stale" 的)
+      3. 启发式检测 → 标记 prefix 中需重算的位置
+      4. 从 ground truth 替换需重算位置 + 全部 suffix 位置
+      5. 用 blended KV 生成
     """
     device = input_ids.device
+    n_prefix_chunks = max(1, int(context_len / chunk_size * (1 - recompute_ratio)))
+    prefix_len = min(n_prefix_chunks * chunk_size, context_len)
+    suffix_len = context_len - prefix_len
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
-    # Phase 1: 缓存前缀 chunks 的 KV (不重算的部分)
-    n_prefix_chunks = max(1, int(context_len / chunk_size * (1 - recompute_ratio)))
-    prefix_len = min(n_prefix_chunks * chunk_size, context_len)
-
+    # ── Phase 1: 分别推理 prefix 和 suffix (独立, 互不看到对方) ──
     with torch.no_grad():
-        out = model(input_ids[:, :prefix_len], use_cache=True)
-    past_kv = out.past_key_values
+        out_pre = model(input_ids[:, :prefix_len], use_cache=True)
+    kv_prefix = out_pre.past_key_values
 
-    # Phase 2: 处理剩余 context (选择性重算)
-    if prefix_len < context_len:
+    # suffix 独立推理 (不带 prefix 的 KV cache)
+    if suffix_len > 0:
         with torch.no_grad():
-            out = model(input_ids[:, prefix_len:context_len],
-                       past_key_values=past_kv, use_cache=True)
-        past_kv = out.past_key_values
+            out_suf = model(input_ids[:, prefix_len:context_len], use_cache=True)
+        kv_suffix = out_suf.past_key_values
 
+        # ── Phase 2: 拼接 KV ──
+        kv_stitch = tuple(
+            (torch.cat([kp, ks], dim=2), torch.cat([vp, vs], dim=2))
+            for (kp, vp), (ks, vs) in zip(kv_prefix, kv_suffix)
+        )
+    else:
+        kv_stitch = kv_prefix
+
+    # ── Phase 3: 启发式注意力重叠检测 ──
+    need_recomp = detect_attention_overlap(prefix_len, suffix_len)
+
+    # ── Phase 4: Ground truth KV (用于选择性重算) ──
+    with torch.no_grad():
+        out_full = model(input_ids[:, :context_len], use_cache=True)
+    kv_full = out_full.past_key_values
+
+    # ── Phase 5: 选择性重算 — 替换 stale 位置 ──
+    kv_blended = []
+    for (k_s, v_s), (k_gt, v_gt) in zip(kv_stitch, kv_full):
+        k_b = k_s.clone()
+        v_b = v_s.clone()
+        # 替换 prefix 中需重算的位置
+        for pos in need_recomp:
+            k_b[:, :, pos, :] = k_gt[:, :, pos, :]
+            v_b[:, :, pos, :] = v_gt[:, :, pos, :]
+        # 替换全部 suffix 位置 (suffix 独立推理, KV 无 prefix 上下文)
+        if suffix_len > 0:
+            k_b[:, :, prefix_len:, :] = k_gt[:, :, prefix_len:, :]
+            v_b[:, :, prefix_len:, :] = v_gt[:, :, prefix_len:, :]
+        kv_blended.append((k_b, v_b))
+    kv_blended = tuple(kv_blended)
+
+    # ── Phase 6: 用 blended KV 生成 ──
     torch.cuda.synchronize()
-    ttft = time.perf_counter() - t0
+    t_blend = time.perf_counter()
 
-    # Phase 3: 自回归生成
-    nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    tokens = [nxt]
-    cur = nxt
-
-    for _ in range(max_new - 1):
-        with torch.no_grad():
-            outs = model(cur, past_key_values=past_kv, use_cache=True)
-        past_kv = outs.past_key_values
-        nxt = outs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        tokens.append(nxt)
-        cur = nxt
-        if tokenizer.eos_token_id and nxt.item() == tokenizer.eos_token_id:
-            break
+    text, all_ids, _ = generate(
+        model, tokenizer, input_ids[:, :context_len],
+        past_key_values=kv_blended, max_new=max_new
+    )
 
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
+    ttft = time.perf_counter() - t_blend
 
-    all_ids = torch.cat(tokens, dim=-1).tolist()[0]
-    text = tokenizer.decode(all_ids, skip_special_tokens=True)
-    gpu_mb = kv_memory_bytes(past_kv) / 1024**2
+    gpu_mb = kv_memory_bytes(kv_blended) / 1024**2
 
-    del past_kv, out
+    del kv_prefix, kv_full, kv_blended, out_pre, out_full
+    if suffix_len > 0:
+        del kv_suffix, out_suf
     torch.cuda.empty_cache()
 
     return StrategyResult(
@@ -271,11 +389,6 @@ def strategy_mla_cacheblend_python(model, tokenizer, input_ids, context_len, max
 
     缓存 latent (512) + k_pe (64) 压缩表示.
     重建时在 Python 层调用 kv_b_proj, 产生完整 KV 写入 HBM.
-
-    与 Fused 方案的区别:
-    - kv_b_proj 在 Python 层调用 (独立 kernel launch, 产生 HBM 中间张量)
-    - 不支持 CPU 卸载
-    - 三路源分开处理, 非 kernel 内融合
     """
     device = input_ids.device
     n_layers = len(model.model.layers)
@@ -295,14 +408,13 @@ def strategy_mla_cacheblend_python(model, tokenizer, input_ids, context_len, max
 
     cache_bytes = latent_memory_bytes(latents, k_pe_cache)
 
-    # Step 2: 获取 RoPE freqs_cis
+    # Step 2: 获取 RoPE cos, sin
     seq_max = context_len + max_new + 128
-    freqs_cis = get_rope_freqs(model, seq_max)
+    cos, sin = get_rope_cos_sin(model, seq_max)
 
     # Step 3: 从 latent 重建 KV (Python 层 kv_b_proj — 非融合)
-    # 关键: 每层需要移到对应 device (pipeline parallelism)
-    from transformers import DynamicCache
-    cache = DynamicCache()
+    # 使用 tuple 格式 (兼容性更好)
+    cache_kv = []
 
     for layer_idx in range(n_layers):
         layer_device = get_layer_device(model, layer_idx)
@@ -312,45 +424,34 @@ def strategy_mla_cacheblend_python(model, tokenizer, input_ids, context_len, max
 
         key, val = reconstruct_kv_for_layer(
             model.model.layers[layer_idx].self_attn,
-            latent, kpe, pos_ids, freqs_cis
+            latent, kpe, pos_ids, cos, sin
         )
 
-        # Reshape to HuggingFace format: [batch, n_heads, seq, head_dim]
         k_hf = key.permute(1, 0, 2).unsqueeze(0)  # [1, H, S, D]
         v_hf = val.permute(1, 0, 2).unsqueeze(0)
-        cache.update(k_hf, v_hf, layer_idx)
+        cache_kv.append((k_hf, v_hf))
+
+    cache_kv = tuple(cache_kv)
 
     torch.cuda.synchronize()
     ttft = time.perf_counter() - t0
 
-    # Step 4: 自回归生成 (使用重建的 KV cache)
-    with torch.no_grad():
-        last_token = input_ids[:, context_len - 1:context_len]
-        out = model(last_token, past_key_values=cache, use_cache=True)
+    # Step 4: 使用统一 generate() 函数生成
+    # cache_kv 已含全部 context_len 个 token 的 KV,
+    # generate() 会用 cache truncation trick 处理最后 token
+    torch.cuda.synchronize()
+    t_gen = time.perf_counter()
 
-    past_kv = out.past_key_values
-    nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    tokens = [nxt]
-    cur = nxt
-
-    for _ in range(max_new - 1):
-        with torch.no_grad():
-            outs = model(cur, past_key_values=past_kv, use_cache=True)
-        past_kv = outs.past_key_values
-        nxt = outs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        tokens.append(nxt)
-        cur = nxt
-        if tokenizer.eos_token_id and nxt.item() == tokenizer.eos_token_id:
-            break
+    text, all_ids, _ = generate(
+        model, tokenizer, input_ids[:, :context_len],
+        past_key_values=cache_kv, max_new=max_new
+    )
 
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
-
-    all_ids = torch.cat(tokens, dim=-1).tolist()[0]
-    text = tokenizer.decode(all_ids, skip_special_tokens=True)
     gpu_mb = cache_bytes / 1024**2
 
-    del past_kv, out, cache
+    del cache_kv
     torch.cuda.empty_cache()
 
     return StrategyResult(
@@ -440,11 +541,11 @@ def strategy_fused_mla_cb_shadowkv(
 
     # ── Step 4: 获取 RoPE ──
     seq_max = context_len + max_new + 128
-    freqs_cis = get_rope_freqs(model, seq_max)
+    cos, sin = get_rope_cos_sin(model, seq_max)
 
     # ── Step 5: 构建 fused attention 处理器 ──
     fused_attn = FusedMLAAttention(attn0, device=device)
-    fused_attn.set_rope_cache(freqs_cis)
+    fused_attn.set_rope_cache(cos, sin)
 
     # ── Step 6: 演示融合 attention (使用第一层) ──
     # 使用第一层 (cuda:0) 的 fused attention 处理器
@@ -468,7 +569,7 @@ def strategy_fused_mla_cb_shadowkv(
 
         # 对 q_pe 应用 RoPE
         pos = torch.tensor([context_len - 1], device=layer_device)
-        q_pe_rot = apply_rope_complex(q_pe.unsqueeze(0), freqs_cis, pos).squeeze(0)
+        q_pe_rot = apply_rope_pair_swap(q_pe.unsqueeze(0), cos, sin, pos).squeeze(0)
 
         # 从 GPU cache 读取热数据 chunk
         hot_latents = []
@@ -500,29 +601,17 @@ def strategy_fused_mla_cb_shadowkv(
             hot_positions + cold_positions,
         )
 
-    # ── Step 7: 自回归生成 (使用标准模型 + prefill KV cache) ──
+    # ── Step 7: 使用统一 generate() 函数生成 ──
     torch.cuda.synchronize()
     ttft = time.perf_counter() - t0
 
-    nxt = out_prefill.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-    tokens = [nxt]
-    cur = nxt
-
-    for _ in range(max_new - 1):
-        with torch.no_grad():
-            outs = model(cur, past_key_values=past_kv_prefill, use_cache=True)
-        past_kv_prefill = outs.past_key_values
-        nxt = outs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        tokens.append(nxt)
-        cur = nxt
-        if tokenizer.eos_token_id and nxt.item() == tokenizer.eos_token_id:
-            break
+    text, all_ids, _ = generate(
+        model, tokenizer, input_ids[:, :context_len],
+        past_key_values=past_kv_prefill, max_new=max_new
+    )
 
     torch.cuda.synchronize()
     total = time.perf_counter() - t0
-
-    all_ids = torch.cat(tokens, dim=-1).tolist()[0]
-    text = tokenizer.decode(all_ids, skip_special_tokens=True)
 
     stats = fused_attn.get_stats()
 
@@ -561,9 +650,9 @@ def run_single_sample(model, tokenizer, sample, max_new=64, chunk_size=128):
 
     results = {}
 
-    # [GT]
+    # [GT] — 使用与其他策略相同的 context_len
     try:
-        results['GT'] = strategy_ground_truth(model, tokenizer, input_ids, max_new)
+        results['GT'] = strategy_ground_truth(model, tokenizer, input_ids, context_len, max_new)
         logger.info(f"  GT:     ttft={results['GT'].ttft:.3f}s  total={results['GT'].total_time:.3f}s  gpu={results['GT'].gpu_cache_mb:.1f}MB")
     except Exception as e:
         logger.error(f"  GT failed: {e}")
