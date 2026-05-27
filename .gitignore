@@ -1,0 +1,54 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.o
+*.a
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Results (large files)
+experiment/results/*.json
+experiment/reports/*.pdf
+experiment/reports/*.png
+
+# Large data files
+*.zip
+*.tar.gz
+*.tar
+
+# Model files (should be downloaded separately)
+models/
+
+# Reference source repos (download separately)
+FlashMLA-main/
+ShadowKV-main/
+vllm-main/
+LMCache-main-deprecate/
+
+# Large data (root level LongBench data)
+/data/
+
+# Claude Code
+.claude/
