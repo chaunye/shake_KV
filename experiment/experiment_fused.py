@@ -58,12 +58,14 @@ from fused_attention import (
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════════════════
 
-def generate(model, tokenizer, input_ids, past_key_values=None, max_new=64):
-    """统一的自回归生成函数 (移植自 compare_v2.py).
+def generate(model, tokenizer, input_ids, past_key_values=None,
+             prefill_logits=None, max_new=64):
+    """统一的自回归生成函数.
 
-    关键:
+    关键设计:
+    - 有 prefilled cache 时直接用 prefill_logits, 不做 truncation
+      (truncation trick 会重算最后 token 的 KV, 引入数值偏差)
     - 显式 position_ids 确保 RoPE 位置正确
-    - cache truncation trick 避免重复 KV entry 偏置 attention
 
     Returns:
         (text, all_ids, first_token_logits): 生成文本, token IDs, 首 token logits
@@ -72,38 +74,35 @@ def generate(model, tokenizer, input_ids, past_key_values=None, max_new=64):
     input_ids = input_ids.to(device)
     seq_len = input_ids.shape[1]
 
-    # Step 0: process input (with or without prefilled cache)
-    with torch.no_grad():
-        if past_key_values is not None:
-            # 统一转换为 tuple 格式以便 truncation 操作
-            if not isinstance(past_key_values, tuple):
-                past_key_values = past_key_values.to_legacy_cache()
-            plen = past_key_values[0][0].shape[2]
-            if seq_len <= plen:
-                # 输入已全在 cache 中 → truncate cache by 1,
-                # 让模型自然处理最后一个 token, 避免重复 KV entry
-                past_key_values = tuple(
-                    (k[:, :, :-1, :].contiguous(), v[:, :, :-1, :].contiguous())
-                    for k, v in past_key_values
-                )
-                cur = input_ids[:, plen - 1:]
-                outs = model(cur, past_key_values=past_key_values, use_cache=True)
-            else:
-                cur = input_ids[:, plen:]
-                outs = model(cur, past_key_values=past_key_values, use_cache=True)
-            past_key_values = outs.past_key_values
-        else:
+    if past_key_values is not None and prefill_logits is not None:
+        # 已有 cache + prefill logits → 直接用, 不做任何模型调用
+        if not isinstance(past_key_values, tuple):
+            past_key_values = past_key_values.to_legacy_cache()
+        first_logits = prefill_logits.to(device)
+    elif past_key_values is not None:
+        # 有 cache 但无 logits → 继续处理剩余 token
+        if not isinstance(past_key_values, tuple):
+            past_key_values = past_key_values.to_legacy_cache()
+        cache_len = past_key_values[0][0].shape[2]
+        with torch.no_grad():
+            outs = model(input_ids[:, cache_len:], past_key_values=past_key_values, use_cache=True)
+        past_key_values = outs.past_key_values
+        first_logits = outs.logits[:, -1, :]
+    else:
+        # 无 cache → 全量 prefill
+        with torch.no_grad():
             outs = model(input_ids, use_cache=True)
+        past_key_values = outs.past_key_values
+        first_logits = outs.logits[:, -1, :]
 
-    past_key_values = outs.past_key_values
-    first_logits = outs.logits[:, -1, :]
     nxt = first_logits.argmax(dim=-1, keepdim=True)
     all_tokens = [nxt]
     cur = nxt
 
-    # Steps 1+: autoregressive with explicit position_ids
+    # 自回归生成
+    cache_len = past_key_values[0][0].shape[2]
     for step in range(max_new - 1):
-        pos = torch.full((1, 1), seq_len + step, dtype=torch.long, device=device)
+        pos = torch.full((1, 1), cache_len + step, dtype=torch.long, device=device)
         with torch.no_grad():
             outs = model(cur, past_key_values=past_key_values, use_cache=True, position_ids=pos)
         past_key_values = outs.past_key_values
@@ -370,7 +369,9 @@ def strategy_pure_cacheblend(model, tokenizer, input_ids, context_len, max_new=6
 
     text, all_ids, _ = generate(
         model, tokenizer, input_ids[:, :context_len],
-        past_key_values=kv_blended, max_new=max_new
+        past_key_values=kv_blended,
+        prefill_logits=out_full.logits[:, -1, :],
+        max_new=max_new
     )
 
     torch.cuda.synchronize()
@@ -446,13 +447,15 @@ def strategy_mla_cacheblend_python(model, tokenizer, input_ids, context_len, max
 
     # Step 4: 使用统一 generate() 函数生成
     # cache_kv 已含全部 context_len 个 token 的 KV,
-    # generate() 会用 cache truncation trick 处理最后 token
+    # 直接用 prefill 的 logits 避免 truncation 引入数值偏差
     torch.cuda.synchronize()
     t_gen = time.perf_counter()
 
     text, all_ids, _ = generate(
         model, tokenizer, input_ids[:, :context_len],
-        past_key_values=cache_kv, max_new=max_new
+        past_key_values=cache_kv,
+        prefill_logits=out.logits[:, -1, :],
+        max_new=max_new
     )
 
     torch.cuda.synchronize()
@@ -615,7 +618,9 @@ def strategy_fused_mla_cb_shadowkv(
 
     text, all_ids, _ = generate(
         model, tokenizer, input_ids[:, :context_len],
-        past_key_values=past_kv_prefill, max_new=max_new
+        past_key_values=past_kv_prefill,
+        prefill_logits=out_prefill.logits[:, -1, :],
+        max_new=max_new
     )
 
     torch.cuda.synchronize()
