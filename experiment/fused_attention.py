@@ -109,24 +109,21 @@ class FusedMLAAttention:
         self.stats['total_latent_tokens'] += S
 
         # ── Step 1: RMSNorm (fused, 不产生 HBM 中间张量) ──
-        ln_w = self.ln_weight.to(device)
+        # 全程 float32 避免精度累积误差
+        ln_w = self.ln_weight.to(device).float()
         latent_f = cached_latent.float()
         variance = latent_f.pow(2).mean(-1, keepdim=True)
-        latent_norm = (latent_f * torch.rsqrt(variance + 1e-6) * ln_w.float()).type_as(cached_latent)  # [S, 512]
+        latent_norm = latent_f * torch.rsqrt(variance + 1e-6) * ln_w  # [S, 512]
 
         # ── Step 2: kv_b_proj (fused → 直接产出 K_nope + V) ──
         # 一次 matmul 同时产出 K 和 V, 避免两次独立的 HBM 读写
-        W = self.W_kv_b.to(device)
-        b = self.b_kv_b.to(device) if self.b_kv_b is not None else None
+        W = self.W_kv_b.to(device).float()
+        b = self.b_kv_b.to(device).float() if self.b_kv_b is not None else None
         kv_out = F.linear(latent_norm, W, b)  # [S, 4096]
 
-        # 拆分 K_nope 和 V
-        k_nope = kv_out[:, :self.n_heads * self.qk_nope_dim]  # [S, 2048]
-        k_nope = k_nope.view(S, self.n_heads, self.qk_nope_dim)  # [S, H, 128]
-
-        v_start = self.n_heads * self.qk_nope_dim
-        v_out = kv_out[:, v_start:v_start + self.n_heads * self.v_dim]  # [S, 2048]
-        v_out = v_out.view(S, self.n_heads, self.v_dim)  # [S, H, 128]
+        # 布局: [S, 4096] → [S, H, nope+v] (per-head 交错, 非连续)
+        kv_reshaped = kv_out.view(S, self.n_heads, self.qk_nope_dim + self.v_dim)
+        k_nope, v_out = torch.split(kv_reshaped, [self.qk_nope_dim, self.v_dim], dim=-1)
 
         # ── Step 3: RoPE on k_pe (与 DeepSeek-V2-Lite 模型一致) ──
         pos = position_ids.to(device)
@@ -139,7 +136,7 @@ class FusedMLAAttention:
         k_swapped = k_pe.view(-1, d // 2, 2).transpose(2, 1).reshape(-1, d)
         # rotate_half
         k_rot_half = torch.cat([-k_swapped[..., d // 2:], k_swapped[..., :d // 2]], dim=-1)
-        k_pe_rot = (k_swapped * cos_sel + k_rot_half * sin_sel).type_as(cached_kpe)  # [S, 64]
+        k_pe_rot = k_swapped * cos_sel.float() + k_rot_half * sin_sel.float()  # [S, 64]
 
         # ── Step 4: QK 点积 (在 latent 空间直接计算) ──
         # Q: [H, 128] nope + [H, 64] pe

@@ -212,6 +212,9 @@ def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, cos, sin):
     """
     从 latent + k_pe 重建完整 KV (非融合, 用于 MLA+CB Python 策略).
 
+    全程 float32 计算避免精度累积误差 (float16 下 RMSNorm → kv_b_proj
+    的级联误差可达 7.6+, 导致 0% match).
+
     与融合版本的关键区别:
     - kv_b_proj 在 Python 层调用 → 产生中间 KV 张量写入 HBM
     - 融合版本在 attention kernel 内部完成, 不产生中间张量
@@ -219,35 +222,40 @@ def reconstruct_kv_for_layer(attn_module, latent, k_pe, position_ids, cos, sin):
     device = latent.device
     S = latent.shape[0]
 
-    # RMSNorm (不是 LayerNorm!)
-    ln_w = attn_module.kv_a_layernorm.weight.to(device)
-    eps = attn_module.kv_a_layernorm.variance_epsilon
-    latent_norm = rms_norm(latent, ln_w, eps)
+    # 全程 float32
+    latent_f = latent.float()
 
-    # kv_b_proj → K_nope + V
-    W = attn_module.kv_b_proj.weight.to(device)
+    # RMSNorm (不是 LayerNorm!)
+    ln_w = attn_module.kv_a_layernorm.weight.to(device).float()
+    eps = attn_module.kv_a_layernorm.variance_epsilon
+    variance = latent_f.pow(2).mean(-1, keepdim=True)
+    latent_norm = latent_f * torch.rsqrt(variance + eps) * ln_w
+
+    # kv_b_proj → K_nope + V (float32 matmul)
+    W = attn_module.kv_b_proj.weight.to(device).float()
     b = attn_module.kv_b_proj.bias
     if b is not None:
-        b = b.to(device)
+        b = b.to(device).float()
     kv_out = F.linear(latent_norm, W, b)  # [S, 4096]
 
     n_heads = attn_module.num_heads
     nope_dim = attn_module.qk_nope_head_dim
     v_dim = attn_module.v_head_dim
 
-    k_nope = kv_out[:, :n_heads * nope_dim].view(S, n_heads, nope_dim)
-    v_out = kv_out[:, n_heads * nope_dim:n_heads * nope_dim + n_heads * v_dim].view(S, n_heads, v_dim)
+    # 布局: [S, 4096] → [S, H, nope+v] (per-head 交错, 非连续)
+    kv_reshaped = kv_out.view(S, n_heads, nope_dim + v_dim)
+    k_nope, v_out = torch.split(kv_reshaped, [nope_dim, v_dim], dim=-1)  # each [S, H, 128]
 
-    # RoPE on k_pe (pair-swap, 与模型内部一致)
-    k_pe_rot = apply_rope_pair_swap(k_pe, cos, sin, position_ids)  # [S, 64]
+    # RoPE on k_pe (pair-swap, 与模型内部一致, float32)
+    k_pe_rot = apply_rope_pair_swap(k_pe.float(), cos, sin, position_ids)  # [S, 64]
 
     # 拼接完整 K: [S, n_heads, nope_dim + rope_dim]
     rope_dim = attn_module.qk_rope_head_dim
-    key_states = torch.zeros(S, n_heads, nope_dim + rope_dim, device=device, dtype=latent.dtype)
+    key_states = torch.zeros(S, n_heads, nope_dim + rope_dim, device=device, dtype=torch.float32)
     key_states[:, :, :nope_dim] = k_nope
     key_states[:, :, nope_dim:] = k_pe_rot.unsqueeze(1).expand(-1, n_heads, -1)
 
-    return key_states, v_out
+    return key_states.to(latent.dtype), v_out.to(latent.dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
